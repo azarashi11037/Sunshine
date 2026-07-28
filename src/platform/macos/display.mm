@@ -2,6 +2,9 @@
  * @file src/platform/macos/display.mm
  * @brief Definitions for display capture on macOS.
  */
+// standard includes
+#include <cstring>
+
 // local includes
 #include "src/config.h"
 #include "src/logging.h"
@@ -68,10 +71,14 @@ namespace platf {
         return true;
       }];
 
+      if (!signal) {
+        return capture_e::error;
+      }
+
       // FIXME: We should time out if an image isn't returned for a while
       dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
 
-      return capture_e::ok;
+      return av_capture.captureFailed ? capture_e::error : capture_e::ok;
     }
 
     std::shared_ptr<img_t> alloc_img() override {
@@ -130,9 +137,13 @@ namespace platf {
         return false;
       }];
 
+      if (!signal) {
+        return 1;
+      }
+
       dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
 
-      return 0;
+      return av_capture.captureFailed ? 1 : 0;
     }
 
     /**
@@ -148,6 +159,37 @@ namespace platf {
 
     static void setPixelFormat(void *display, OSType pixelFormat) {
       static_cast<AVVideo *>(display).pixelFormat = pixelFormat;
+    }
+
+    bool is_hdr() override {
+      return av_capture.isHDRCaptureEnabled;
+    }
+
+    bool get_hdr_metadata(SS_HDR_METADATA &metadata) override {
+      if (!is_hdr()) {
+        return false;
+      }
+
+      std::memset(&metadata, 0, sizeof(metadata));
+
+      // ScreenCaptureKit is configured for BT.2020 primaries, D65 white,
+      // and SMPTE ST 2084 PQ. Luminance values use a conservative HDR10
+      // mastering envelope suitable for a remote canonical HDR display.
+      metadata.displayPrimaries[0].x = 0.708f * 50000;
+      metadata.displayPrimaries[0].y = 0.292f * 50000;
+      metadata.displayPrimaries[1].x = 0.170f * 50000;
+      metadata.displayPrimaries[1].y = 0.797f * 50000;
+      metadata.displayPrimaries[2].x = 0.131f * 50000;
+      metadata.displayPrimaries[2].y = 0.046f * 50000;
+      metadata.whitePoint.x = 0.3127f * 50000;
+      metadata.whitePoint.y = 0.3290f * 50000;
+      metadata.maxDisplayLuminance = 1000;
+      metadata.minDisplayLuminance = 1;
+      metadata.maxContentLightLevel = 0;
+      metadata.maxFrameAverageLightLevel = 0;
+      metadata.maxFullFrameLuminance = 1000;
+
+      return true;
     }
   };
 
@@ -177,11 +219,19 @@ namespace platf {
     }
     BOOST_LOG(info) << "Configuring selected display ("sv << display->display_id << ") to stream"sv;
 
-    display->av_capture = [[AVVideo alloc] initWithDisplay:display->display_id frameRate:config.framerate];
+    const bool request_hdr_capture =
+      config.dynamicRange > 0 && hwdevice_type == platf::mem_type_e::videotoolbox;
+    display->av_capture = [[AVVideo alloc] initWithDisplay:display->display_id
+                                                frameRate:config.framerate
+                                                      hdr:request_hdr_capture];
 
     if (!display->av_capture) {
       BOOST_LOG(error) << "Video setup failed."sv;
       return nullptr;
+    }
+
+    if (display->av_capture.isHDRCaptureEnabled) {
+      BOOST_LOG(info) << "Using ScreenCaptureKit BT.2020 PQ HDR capture"sv;
     }
 
     display->width = display->av_capture.frameWidth;
