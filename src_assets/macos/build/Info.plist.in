@@ -5,9 +5,9 @@
   <key>CFBundleIdentifier</key>
   <string>@PROJECT_FQDN@</string>
   <key>CFBundleName</key>
-  <string>@CMAKE_PROJECT_NAME@</string>
+  <string>Sunshine HDR Test</string>
   <key>CFBundleDisplayName</key>
-  <string>@CMAKE_PROJECT_NAME@</string>
+  <string>Sunshine HDR Test</string>
   <key>CFBundleExecutable</key>
   <string>@CMAKE_PROJECT_NAME@</string>
   <key>CFBundlePackageType</key>
@@ -23,11 +23,11 @@
   <key>LSUIElement</key>
   <true/>
   <key>NSMicrophoneUsageDescription</key>
-  <string>@CMAKE_PROJECT_NAME@ requires access to your microphone to stream audio.</string>
+  <string>Sunshine HDR Test requires access to your microphone to stream audio.</string>
   <key>NSAudioCaptureUsageDescription</key>
-  <string>@CMAKE_PROJECT_NAME@ requires access to system audio to capture and stream audio output.</string>
+  <string>Sunshine HDR Test requires access to system audio to capture and stream audio output.</string>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>@CMAKE_PROJECT_NAME@ requires access to screen recording to capture and stream your screen content.</string>
+  <string>Sunshine HDR Test requires access to screen recording to capture and stream your screen content.</string>
   <key>NSBonjourServices</key>
 	<array>
 		<string>_nvstream._tcp</string>
