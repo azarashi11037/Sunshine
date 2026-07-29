@@ -18,6 +18,9 @@ else()
     add_custom_command(TARGET sunshine POST_BUILD
             COMMENT "Copying bundle resources to build tree"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${_bundle_resources_dir}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${PROJECT_SOURCE_DIR}/src_assets/macos/build/sunshine.icns"
+                    "${_bundle_resources_dir}/sunshine.icns"
             COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_BINARY_DIR}/assets" "${_bundle_resources_dir}/assets"
             VERBATIM)
 endif()
