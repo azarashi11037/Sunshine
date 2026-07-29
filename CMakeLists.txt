@@ -4,6 +4,13 @@ cmake_minimum_required(VERSION 3.20)
 # `cmake_path(CONVERT ... TO_NATIVE_PATH_LIST ...)` requires 3.20
 # todo - set this conditionally
 
+if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    # ScreenCaptureKit HDR capture is available starting with macOS 15.
+    # Pin the target so local release builds do not silently require the
+    # currently installed macOS SDK version.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum supported macOS version")
+endif()
+
 project(Sunshine VERSION 0.0.0
         DESCRIPTION "Self-hosted game stream host for Moonlight"
         HOMEPAGE_URL "https://app.lizardbyte.dev/Sunshine")

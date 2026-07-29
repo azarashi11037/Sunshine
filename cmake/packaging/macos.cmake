@@ -10,6 +10,9 @@ if (SUNSHINE_BUILD_HOMEBREW)
 else()
     # .app build
     set(APPLE_CODESIGN_IDENTITY "" CACHE STRING "Codesign identity, e.g. 'Developer ID Application: Name (TEAMID)'")
+    set(CPACK_PACKAGE_VENDOR "${SUNSHINE_PUBLISHER_NAME}")
+    set(CPACK_PACKAGE_HOMEPAGE_URL "${SUNSHINE_PUBLISHER_WEBSITE}")
+    set(CPACK_PACKAGE_CONTACT "${SUNSHINE_PUBLISHER_ISSUE_URL}")
 
     # Build an .app
     set(CMAKE_MACOSX_BUNDLE YES)
@@ -28,6 +31,13 @@ else()
 
     install(FILES "${PROJECT_SOURCE_DIR}/src_assets/macos/build/sunshine.icns"
             DESTINATION "${MAC_BUNDLE_RESOURCES}"
+            COMPONENT Runtime)
+
+    install(FILES
+            "${PROJECT_SOURCE_DIR}/LICENSE"
+            "${PROJECT_SOURCE_DIR}/NOTICE"
+            "${PROJECT_SOURCE_DIR}/FORK_NOTICE.md"
+            DESTINATION "${MAC_BUNDLE_RESOURCES}/licenses"
             COMPONENT Runtime)
 
     # macOS-specific assets (apps.json, etc.)

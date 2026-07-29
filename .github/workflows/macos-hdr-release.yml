@@ -1,0 +1,155 @@
+---
+name: macOS HDR release build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BRANCH: macos-screen-capture-hdr
+  BUILD_VERSION: "0.1.0"
+  COMMIT: ${{ github.sha }}
+  TAG: macos-hdr-v0.1.0
+  MACOSX_DEPLOYMENT_TARGET: "15.0"
+
+jobs:
+  build_macos_arm64:
+    name: Build and verify macOS arm64 DMG
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source and submodules
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Verify Apple Silicon runner
+        run: |
+          test "$(uname -m)" = "arm64"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Install build dependencies
+        timeout-minutes: 8
+        run: |
+          brew install --force \
+            cmake \
+            doxygen \
+            graphviz \
+            node \
+            pkgconf \
+            icu4c@78 \
+            miniupnpc \
+            openssl@3 \
+            opus
+
+      - name: Configure
+        run: |
+          cmake \
+            -B build \
+            -S . \
+            -DBUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DICU_ROOT="$(brew --prefix icu4c@78)" \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+            -DOpus_ROOT_DIR="$(brew --prefix opus)" \
+            -DSUNSHINE_PUBLISHER_NAME="azarashi11037" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/azarashi11037/Sunshine" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/azarashi11037/Sunshine/issues" \
+            -DAPPLE_CODESIGN_IDENTITY="-"
+
+      - name: Build
+        run: cmake --build build --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Run unit tests
+        working-directory: build/tests
+        # Hardware-dependent audio and pointer tests require an interactive
+        # desktop. The remaining suite still includes VideoToolbox validation.
+        run: >-
+          ./test_sunshine
+          --gtest_color=yes
+          --gtest_output=xml:test_results.xml
+          --gtest_filter=-Configurations/AudioTest.*:MouseInputs/MouseHIDTest.*
+
+      - name: Package ad-hoc signed DMG
+        env:
+          SHOULD_SIGN: "true"
+        run: |
+          if ! cpack -G DragNDrop --config build/CPackConfig.cmake; then
+            echo "cpack failed; retrying once with verbose output"
+            cpack -G DragNDrop --config build/CPackConfig.cmake --verbose
+          fi
+
+          mkdir -p artifacts
+          cp \
+            build/cpack_artifacts/Sunshine.dmg \
+            artifacts/Sunshine-macOS-HDR-v0.1.0-arm64-adhoc.dmg
+
+      - name: Verify packaged application
+        run: |
+          artifact_name="Sunshine-macOS-HDR-v0.1.0-arm64-adhoc.dmg"
+          mount_dir="${RUNNER_TEMP}/sunshine-hdr-dmg"
+          app_path="${mount_dir}/Sunshine.app"
+          executable="${app_path}/Contents/MacOS/Sunshine"
+
+          mkdir -p "${mount_dir}"
+          hdiutil attach \
+            -nobrowse \
+            -readonly \
+            -mountpoint "${mount_dir}" \
+            "artifacts/${artifact_name}"
+
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          codesign -d --verbose=4 "${app_path}" 2>&1 | tee "${RUNNER_TEMP}/codesign.txt"
+          grep -q "Signature=adhoc" "${RUNNER_TEMP}/codesign.txt"
+
+          test "$(plutil -extract CFBundleIdentifier raw "${app_path}/Contents/Info.plist")" = \
+            "local.sunshine.hdr-test"
+          lipo -archs "${executable}" | grep -qw "arm64"
+          vtool -show-build "${executable}" | tee "${RUNNER_TEMP}/build-version.txt"
+          grep -Eq "minos[[:space:]]+15(\\.0)?" "${RUNNER_TEMP}/build-version.txt"
+
+          test -f "${app_path}/Contents/Resources/licenses/LICENSE"
+          test -f "${app_path}/Contents/Resources/licenses/NOTICE"
+          test -f "${app_path}/Contents/Resources/licenses/FORK_NOTICE.md"
+
+          while IFS= read -r -d "" candidate; do
+            if file "${candidate}" | grep -q "Mach-O"; then
+              echo "==> ${candidate}"
+              otool -L "${candidate}"
+            fi
+          done < <(find "${app_path}/Contents" -type f -print0) \
+            | tee "${RUNNER_TEMP}/linked-libraries.txt"
+          if grep -Eq "/opt/homebrew|/Users/runner" "${RUNNER_TEMP}/linked-libraries.txt"; then
+            echo "Package contains a non-portable build-machine library path"
+            exit 1
+          fi
+
+          if find "${app_path}" -type f \
+              \( -name "sunshine.conf" \
+              -o -name "sunshine.log" \
+              -o -name "credentials.json" \
+              -o -name "state.json" \) \
+              -print | grep -q .; then
+            echo "Package contains local configuration or log data"
+            exit 1
+          fi
+
+          hdiutil detach "${mount_dir}"
+
+          (
+            cd artifacts
+            shasum -a 256 "${artifact_name}" > "${artifact_name}.sha256"
+          )
+
+      - name: Upload verified release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: Sunshine-macOS-HDR-v0.1.0-arm64
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
