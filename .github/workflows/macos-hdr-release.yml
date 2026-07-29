@@ -124,7 +124,9 @@ jobs:
             fi
           done < <(find "${app_path}/Contents" -type f -print0) \
             | tee "${RUNNER_TEMP}/linked-libraries.txt"
-          if grep -Eq "/opt/homebrew|/Users/runner" "${RUNNER_TEMP}/linked-libraries.txt"; then
+          if grep -Eq \
+              "^[[:space:]]+(/opt/homebrew|/Users/runner)" \
+              "${RUNNER_TEMP}/linked-libraries.txt"; then
             echo "Package contains a non-portable build-machine library path"
             exit 1
           fi
