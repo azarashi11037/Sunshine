@@ -96,8 +96,8 @@ jobs:
           executable="${app_path}/Contents/MacOS/Sunshine"
 
           mkdir -p "${mount_dir}"
-          hdiutil attach \
-            -acceptlicense \
+          trap 'hdiutil detach "${mount_dir}" >/dev/null 2>&1 || true' EXIT
+          printf 'Y\n' | hdiutil attach \
             -nobrowse \
             -readonly \
             -mountpoint "${mount_dir}" \
@@ -140,6 +140,7 @@ jobs:
           fi
 
           hdiutil detach "${mount_dir}"
+          trap - EXIT
 
           (
             cd artifacts
