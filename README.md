@@ -20,7 +20,7 @@
 | Binary | Apple Silicon (`arm64`), deployment target macOS 15.0+ |
 | Tested | M2 Pro, macOS 27.0 beta, 2732×2048, 120 Hz, HEVC Main10 HDR |
 | Signing | Ad-hoc signed; **not Apple-notarized** |
-| License | [GPL-3.0-only](LICENSE) |
+| License | [GPL-3.0-only](https://github.com/azarashi11037/Sunshine/blob/macos-hdr-v0.1.0/LICENSE) |
 
 ## 简体中文
 
@@ -110,4 +110,8 @@ This repository retains the upstream copyright, license, and notice files. Fork 
 git clone --recursive --branch macos-hdr-v0.1.0 https://github.com/azarashi11037/Sunshine.git
 ```
 
-See [FORK_NOTICE.md](FORK_NOTICE.md), [LICENSE](LICENSE), and [NOTICE](NOTICE). Sunshine and LizardByte names remain associated with their respective owners; this fork is not affiliated with or endorsed by LizardByte.
+See [FORK_NOTICE.md](https://github.com/azarashi11037/Sunshine/blob/macos-hdr-v0.1.0/FORK_NOTICE.md),
+[LICENSE](https://github.com/azarashi11037/Sunshine/blob/macos-hdr-v0.1.0/LICENSE), and
+[NOTICE](https://github.com/azarashi11037/Sunshine/blob/macos-hdr-v0.1.0/NOTICE).
+Sunshine and LizardByte names remain associated with their respective owners;
+this fork is not affiliated with or endorsed by LizardByte.
