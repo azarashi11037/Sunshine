@@ -214,8 +214,12 @@
         return nil;
       }
 
-      SCStreamConfiguration *configuration =
-        [SCStreamConfiguration streamConfigurationWithPreset:SCStreamConfigurationPresetCaptureHDRStreamCanonicalDisplay];
+      // Build the HDR configuration explicitly. The canonical HDR preset
+      // defaults to packed 4:4:4, while VideoToolbox HEVC Main10 consumes
+      // P010. Request P010 at capture time to avoid an intermediate chroma
+      // conversion and guarantee the format validated below.
+      SCStreamConfiguration *configuration = [[[SCStreamConfiguration alloc] init] autorelease];
+      configuration.captureDynamicRange = SCCaptureDynamicRangeHDRCanonicalDisplay;
       configuration.width = self.frameWidth;
       configuration.height = self.frameHeight;
       configuration.minimumFrameInterval = self.minFrameDuration;

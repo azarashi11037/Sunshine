@@ -19,6 +19,7 @@
 #include "src/input.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/platform/macos/misc.h"
 #include "src/utility.h"
 
 /**
@@ -567,22 +568,9 @@ const KeyCodeMap kKeyCodesMap[] = {
     macos_input->display = CGMainDisplayID();
 
     auto output_name = display_device::map_output_name(config::video.output_name);
-    // If output_name is set, try to find the display with that display id
+    // Resolve either a legacy display id or a stable UUID selector.
     if (!output_name.empty()) {
-      const int MAX_DISPLAYS = 32;
-      uint32_t max_display = MAX_DISPLAYS;
-      uint32_t display_count;
-      CGDirectDisplayID displays[MAX_DISPLAYS];
-      if (CGGetActiveDisplayList(max_display, displays, &display_count) != kCGErrorSuccess) {
-        BOOST_LOG(error) << "Unable to get active display list , error: "sv << std::endl;
-      } else {
-        for (int i = 0; i < display_count; i++) {
-          CGDirectDisplayID display_id = displays[i];
-          if (display_id == std::atoi(output_name.c_str())) {
-            macos_input->display = display_id;
-          }
-        }
-      }
+      macos_input->display = display_id_from_selector(output_name, macos_input->display);
     }
 
     // Input coordinates are based on the virtual resolution not the physical, so we need the scaling factor

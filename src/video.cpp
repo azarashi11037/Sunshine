@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <map>
 #include <thread>
 
 // lib includes
@@ -307,12 +308,23 @@ namespace video {
 
   class avcodec_encode_session_t: public encode_session_t {
   public:
+    struct pending_frame_t {
+      std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+      bool requested_idr;
+    };
+
     avcodec_encode_session_t() = default;
 
-    avcodec_encode_session_t(avcodec_ctx_t &&avcodec_ctx, std::unique_ptr<platf::avcodec_encode_device_t> encode_device, int inject):
+    avcodec_encode_session_t(
+      avcodec_ctx_t &&avcodec_ctx,
+      std::unique_ptr<platf::avcodec_encode_device_t> encode_device,
+      int inject,
+      std::size_t max_pending_frames
+    ):
         avcodec_ctx {std::move(avcodec_ctx)},
         device {std::move(encode_device)},
-        inject {inject} {
+        inject {inject},
+        max_pending_frames {max_pending_frames} {
     }
 
     avcodec_encode_session_t(avcodec_encode_session_t &&other) noexcept = default;
@@ -336,8 +348,10 @@ namespace video {
       replacements = std::move(other.replacements);
       sps = std::move(other.sps);
       vps = std::move(other.vps);
+      pending_frames = std::move(other.pending_frames);
 
       inject = other.inject;
+      max_pending_frames = other.max_pending_frames;
 
       return *this;
     }
@@ -378,8 +392,13 @@ namespace video {
     cbs::nal_t sps;
     cbs::nal_t vps;
 
+    std::map<int64_t, pending_frame_t> pending_frames;
+
     // inject sps/vps data into idr pictures
     int inject;
+
+    // Zero preserves the encoder's default asynchronous queue behavior.
+    std::size_t max_pending_frames;
   };
 
   class nvenc_encode_session_t: public encode_session_t {
@@ -1126,7 +1145,13 @@ namespace video {
         {"max_ref_frames"s, 1},
       },
       {},  // SDR-specific options
-      {},  // HDR-specific options
+      {
+        // VideoToolbox's low-delay HEVC rate control forces one-in-one-out
+        // encoding. At iPad native resolution on M2 Pro, that serializes the
+        // pipeline at roughly one frame per hardware encode interval. Allow
+        // VideoToolbox to queue HDR frames so capture and encoding can overlap.
+        {"flags"s, "-low_delay"},
+      },
       {},  // YUV444 SDR-specific options
       {},  // YUV444 HDR-specific options
       {},  // Fallback options
@@ -1511,40 +1536,38 @@ namespace video {
     }
   }
 
-  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
-    auto &frame = session.device->frame;
-    frame->pts = frame_nr;
-
+  int receive_avcodec_packets(
+    avcodec_encode_session_t &session,
+    safe::mail_raw_t::queue_t<packet_t> &packets,
+    void *channel_data,
+    bool stop_after_first
+  ) {
     auto &ctx = session.avcodec_ctx;
-
     auto &sps = session.sps;
     auto &vps = session.vps;
 
-    // send the frame to the encoder
-    auto ret = avcodec_send_frame(ctx.get(), frame);
-    if (ret < 0) {
-      char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
-      BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
-
-      return -1;
-    }
-
+    int packets_received = 0;
+    int ret = 0;
     while (ret >= 0) {
       auto packet = std::make_unique<packet_raw_avcodec>();
       auto av_packet = packet.get()->av_packet;
 
       ret = avcodec_receive_packet(ctx.get(), av_packet);
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        return 0;
+        return packets_received;
       } else if (ret < 0) {
         return ret;
       }
 
+      auto pending_frame = session.pending_frames.find(av_packet->pts);
+      const bool requested_idr =
+        pending_frame != session.pending_frames.end() && pending_frame->second.requested_idr;
+
       if (av_packet->flags & AV_PKT_FLAG_KEY) {
-        BOOST_LOG(debug) << "Frame "sv << frame_nr << ": IDR Keyframe (AV_FRAME_FLAG_KEY)"sv;
+        BOOST_LOG(debug) << "Frame "sv << av_packet->pts << ": IDR Keyframe (AV_PKT_FLAG_KEY)"sv;
       }
 
-      if ((frame->flags & AV_FRAME_FLAG_KEY) && !(av_packet->flags & AV_PKT_FLAG_KEY)) {
+      if (requested_idr && !(av_packet->flags & AV_PKT_FLAG_KEY)) {
         BOOST_LOG(error) << "Encoder did not produce IDR frame when requested!"sv;
       }
 
@@ -1573,16 +1596,67 @@ namespace video {
         );
       }
 
-      if (av_packet && av_packet->pts == frame_nr) {
-        packet->frame_timestamp = frame_timestamp;
+      if (pending_frame != session.pending_frames.end()) {
+        packet->frame_timestamp = pending_frame->second.frame_timestamp;
+        session.pending_frames.erase(pending_frame);
       }
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
       packets->raise(std::move(packet));
+      packets_received += 1;
+
+      if (stop_after_first) {
+        return packets_received;
+      }
     }
 
-    return 0;
+    return packets_received;
+  }
+
+  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    auto &frame = session.device->frame;
+    auto &ctx = session.avcodec_ctx;
+
+    if (session.max_pending_frames > 0) {
+      const auto wait_started = std::chrono::steady_clock::now();
+      while (session.pending_frames.size() >= session.max_pending_frames) {
+        const int received = receive_avcodec_packets(session, packets, channel_data, true);
+        if (received < 0) {
+          return received;
+        }
+        if (received == 0) {
+          if (std::chrono::steady_clock::now() - wait_started > 250ms) {
+            BOOST_LOG(error) << "Timed out waiting for an asynchronous VideoToolbox frame"sv;
+            return -1;
+          }
+          std::this_thread::sleep_for(100us);
+        }
+      }
+    }
+
+    frame->pts = frame_nr;
+    const bool requested_idr = (frame->flags & AV_FRAME_FLAG_KEY) != 0;
+
+    // send the frame to the encoder
+    auto ret = avcodec_send_frame(ctx.get(), frame);
+    if (ret < 0) {
+      char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+      BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
+
+      return -1;
+    }
+
+    session.pending_frames.emplace(
+      frame_nr,
+      avcodec_encode_session_t::pending_frame_t {
+        .frame_timestamp = frame_timestamp,
+        .requested_idr = requested_idr,
+      }
+    );
+
+    ret = receive_avcodec_packets(session, packets, channel_data, false);
+    return ret < 0 ? ret : 0;
   }
 
   int encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
@@ -1988,12 +2062,24 @@ namespace video {
 
     encode_device_final->apply_colorspace();
 
+    std::size_t max_pending_frames = 0;
+#ifdef __APPLE__
+    if (encoder.name == "videotoolbox"sv && config.videoFormat == 1 && config.dynamicRange) {
+      // Four in-flight HEVC Main10 frames are the minimum that sustain 120 FPS
+      // at 2732x2048 on M2 Pro while bounding VideoToolbox's asynchronous queue.
+      max_pending_frames = 4;
+      BOOST_LOG(info) << "Limiting asynchronous VideoToolbox HDR queue to "sv
+                      << max_pending_frames << " frames"sv;
+    }
+#endif
+
     auto session = std::make_unique<avcodec_encode_session_t>(
       std::move(ctx),
       std::move(encode_device_final),
 
       // 0 ==> don't inject, 1 ==> inject for h264, 2 ==> inject for hevc
-      config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0
+      config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0,
+      max_pending_frames
     );
 
     return session;

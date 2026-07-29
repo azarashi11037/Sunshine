@@ -201,9 +201,6 @@ namespace platf {
 
     auto display = std::make_shared<av_display_t>();
 
-    // Default to main display
-    display->display_id = CGMainDisplayID();
-
     // Print all displays available with it's name and id
     auto display_array = [AVVideo displayNames];
     BOOST_LOG(info) << "Detecting displays"sv;
@@ -213,10 +210,8 @@ namespace platf {
       NSString *name = item[@"displayName"];
       // We are using CGGetActiveDisplayList that only returns active displays so hardcoded connected value in log to true
       BOOST_LOG(info) << "Detected display: "sv << name.UTF8String << " (id: "sv << [NSString stringWithFormat:@"%@", display_id].UTF8String << ") connected: true"sv;
-      if (!display_name.empty() && std::atoi(display_name.c_str()) == [display_id unsignedIntValue]) {
-        display->display_id = [display_id unsignedIntValue];
-      }
     }
+    display->display_id = display_id_from_selector(display_name, CGMainDisplayID());
     BOOST_LOG(info) << "Configuring selected display ("sv << display->display_id << ") to stream"sv;
 
     const bool request_hdr_capture =
@@ -247,11 +242,21 @@ namespace platf {
     __block std::vector<std::string> display_names;
 
     auto display_array = [AVVideo displayNames];
+    const bool use_stable_selectors = config::video.output_name.rfind("uuid:", 0) == 0;
 
     display_names.reserve([display_array count]);
     [display_array enumerateObjectsUsingBlock:^(NSDictionary *_Nonnull obj, NSUInteger idx, BOOL *_Nonnull stop) {
-      NSString *name = obj[@"name"];
-      display_names.emplace_back(name.UTF8String);
+      if (use_stable_selectors) {
+        NSNumber *display_id = obj[@"id"];
+        auto selector = display_uuid_selector([display_id unsignedIntValue]);
+        if (!selector.empty()) {
+          display_names.emplace_back(std::move(selector));
+          return;
+        }
+      }
+
+      NSString *legacy_name = obj[@"name"];
+      display_names.emplace_back(legacy_name.UTF8String);
     }];
 
     return display_names;

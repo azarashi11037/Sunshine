@@ -9,11 +9,13 @@
 #endif
 
 // standard includes
+#include <charconv>
 #include <fcntl.h>
 #include <ifaddrs.h>
 
 // platform includes
 #include <arpa/inet.h>
+#include <ColorSync/ColorSync.h>
 #include <dlfcn.h>
 #include <Foundation/Foundation.h>
 #include <mach-o/dyld.h>
@@ -50,6 +52,66 @@ namespace platf {
   namespace {
     auto screen_capture_allowed = std::atomic<bool> {false};
   }  // namespace
+
+  std::string display_uuid_selector(CGDirectDisplayID display_id) {
+    CFUUIDRef display_uuid = CGDisplayCreateUUIDFromDisplayID(display_id);
+    if (!display_uuid) {
+      return {};
+    }
+
+    CFStringRef display_uuid_string = CFUUIDCreateString(kCFAllocatorDefault, display_uuid);
+    CFRelease(display_uuid);
+    if (!display_uuid_string) {
+      return {};
+    }
+
+    char uuid_buffer[64] {};
+    const bool converted = CFStringGetCString(
+      display_uuid_string,
+      uuid_buffer,
+      sizeof(uuid_buffer),
+      kCFStringEncodingUTF8
+    );
+    CFRelease(display_uuid_string);
+
+    if (!converted) {
+      return {};
+    }
+
+    return "uuid:"s + uuid_buffer;
+  }
+
+  CGDirectDisplayID display_id_from_selector(std::string_view selector, CGDirectDisplayID fallback) {
+    if (selector.empty()) {
+      return fallback;
+    }
+
+    CGDirectDisplayID numeric_display_id {};
+    const auto numeric_result = std::from_chars(
+      selector.data(),
+      selector.data() + selector.size(),
+      numeric_display_id
+    );
+    const bool is_numeric_selector =
+      numeric_result.ec == std::errc {} && numeric_result.ptr == selector.data() + selector.size();
+
+    constexpr uint32_t max_displays = 32;
+    CGDirectDisplayID active_displays[max_displays] {};
+    uint32_t display_count {};
+    if (CGGetActiveDisplayList(max_displays, active_displays, &display_count) != kCGErrorSuccess) {
+      return fallback;
+    }
+
+    for (uint32_t index = 0; index < display_count; ++index) {
+      const auto display_id = active_displays[index];
+      if ((is_numeric_selector && display_id == numeric_display_id) ||
+          (!is_numeric_selector && selector == display_uuid_selector(display_id))) {
+        return display_id;
+      }
+    }
+
+    return fallback;
+  }
 
   // Return whether screen capture is allowed for this process.
   bool is_screen_capture_allowed() {
