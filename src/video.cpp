@@ -2063,12 +2063,34 @@ namespace video {
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
 
     {
-      // Load a dummy image into the AVFrame to ensure we have something to encode
-      // even if we timeout waiting on the first frame. This is a relatively large
-      // allocation which can be freed immediately after convert(), so we do this
-      // in a separate scope.
-      auto dummy_img = disp->alloc_img();
-      if (!dummy_img || disp->dummy_img(dummy_img.get()) || session->convert(*dummy_img)) {
+      std::shared_ptr<platf::img_t> initial_img;
+
+#ifdef __APPLE__
+      // ScreenCaptureKit only permits one active stream for this HDR display
+      // instance. The parallel capture thread already owns that stream, so use
+      // its first frame instead of starting a second one through dummy_img().
+      if (disp->is_hdr() && encoder.name == "videotoolbox"sv) {
+        while (!shutdown_event->peek() && images->running() && !initial_img) {
+          initial_img = images->pop(100ms);
+        }
+
+        if (!initial_img) {
+          return;
+        }
+
+        BOOST_LOG(info) << "Initializing parallel VideoToolbox encoder from the first captured HDR frame";
+      } else
+#endif
+      {
+        // Load a dummy image into the AVFrame to ensure we have something to
+        // encode even if we timeout waiting on the first frame.
+        initial_img = disp->alloc_img();
+        if (!initial_img || disp->dummy_img(initial_img.get())) {
+          return;
+        }
+      }
+
+      if (session->convert(*initial_img)) {
         return;
       }
     }
