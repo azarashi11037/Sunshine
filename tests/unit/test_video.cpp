@@ -6,6 +6,73 @@
 
 #include <src/video.h>
 
+using namespace std::chrono_literals;
+
+TEST(AsyncQueueBackpressureTest, AllowsUnlimitedOrAvailableQueue) {
+  std::optional<std::chrono::steady_clock::time_point> saturated_since;
+  const auto now = std::chrono::steady_clock::time_point {} + 1s;
+
+  EXPECT_EQ(
+    video::detail::async_queue_action(100, 0, saturated_since, now, 500ms),
+    video::detail::async_queue_action_e::submit
+  );
+  EXPECT_EQ(
+    video::detail::async_queue_action(3, 4, saturated_since, now, 500ms),
+    video::detail::async_queue_action_e::submit
+  );
+  EXPECT_FALSE(saturated_since.has_value());
+}
+
+TEST(AsyncQueueBackpressureTest, RetriesWithoutBlockingWhenFull) {
+  std::optional<std::chrono::steady_clock::time_point> saturated_since;
+  const auto now = std::chrono::steady_clock::time_point {} + 1s;
+
+  EXPECT_EQ(
+    video::detail::async_queue_action(4, 4, saturated_since, now, 500ms),
+    video::detail::async_queue_action_e::retry
+  );
+  ASSERT_TRUE(saturated_since.has_value());
+  EXPECT_EQ(*saturated_since, now);
+  EXPECT_EQ(
+    video::detail::async_queue_action(4, 4, saturated_since, now + 499ms, 500ms),
+    video::detail::async_queue_action_e::retry
+  );
+}
+
+TEST(AsyncQueueBackpressureTest, TimesOutOnlyAfterSustainedStall) {
+  std::optional<std::chrono::steady_clock::time_point> saturated_since;
+  const auto now = std::chrono::steady_clock::time_point {} + 1s;
+
+  EXPECT_EQ(
+    video::detail::async_queue_action(4, 4, saturated_since, now, 500ms),
+    video::detail::async_queue_action_e::retry
+  );
+  EXPECT_EQ(
+    video::detail::async_queue_action(4, 4, saturated_since, now + 500ms, 500ms),
+    video::detail::async_queue_action_e::timeout
+  );
+}
+
+TEST(AsyncQueueBackpressureTest, ProgressResetsStallWindow) {
+  std::optional<std::chrono::steady_clock::time_point> saturated_since;
+  const auto now = std::chrono::steady_clock::time_point {} + 1s;
+
+  EXPECT_EQ(
+    video::detail::async_queue_action(4, 4, saturated_since, now, 500ms),
+    video::detail::async_queue_action_e::retry
+  );
+  EXPECT_EQ(
+    video::detail::async_queue_action(3, 4, saturated_since, now + 400ms, 500ms),
+    video::detail::async_queue_action_e::submit
+  );
+  EXPECT_FALSE(saturated_since.has_value());
+  EXPECT_EQ(
+    video::detail::async_queue_action(4, 4, saturated_since, now + 600ms, 500ms),
+    video::detail::async_queue_action_e::retry
+  );
+  EXPECT_EQ(*saturated_since, now + 600ms);
+}
+
 struct EncoderTest: PlatformTestSuite, testing::WithParamInterface<video::encoder_t *> {
   void SetUp() override {
     auto &encoder = *GetParam();

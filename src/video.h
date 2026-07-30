@@ -4,6 +4,11 @@
  */
 #pragma once
 
+// standard includes
+#include <chrono>
+#include <cstddef>
+#include <optional>
+
 // local includes
 #include "input.h"
 #include "platform/common.h"
@@ -18,6 +23,29 @@ extern "C" {
 struct AVPacket;
 
 namespace video {
+
+  namespace detail {
+    enum class async_queue_action_e {
+      submit,
+      retry,
+      timeout,
+    };
+
+    /**
+     * @brief Decide whether an asynchronous encoder can accept another frame.
+     *
+     * A saturated queue must never block the capture/encode loop. The caller
+     * retries with its latest frame until the encoder makes progress, while a
+     * sustained lack of output is still treated as an encoder failure.
+     */
+    async_queue_action_e async_queue_action(
+      std::size_t pending_frames,
+      std::size_t max_pending_frames,
+      std::optional<std::chrono::steady_clock::time_point> &saturated_since,
+      std::chrono::steady_clock::time_point now,
+      std::chrono::steady_clock::duration timeout
+    );
+  }  // namespace detail
 
   /* Encoding configuration requested by remote client */
   struct config_t {

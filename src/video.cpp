@@ -42,6 +42,28 @@ using namespace std::literals;
 
 namespace video {
 
+  detail::async_queue_action_e detail::async_queue_action(
+    std::size_t pending_frames,
+    std::size_t max_pending_frames,
+    std::optional<std::chrono::steady_clock::time_point> &saturated_since,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::duration timeout
+  ) {
+    if (max_pending_frames == 0 || pending_frames < max_pending_frames) {
+      saturated_since.reset();
+      return async_queue_action_e::submit;
+    }
+
+    if (!saturated_since) {
+      saturated_since = now;
+      return async_queue_action_e::retry;
+    }
+
+    return now - *saturated_since >= timeout ?
+             async_queue_action_e::timeout :
+             async_queue_action_e::retry;
+  }
+
   namespace {
     /**
      * @brief Check if we can allow probing for the encoders.
@@ -306,6 +328,12 @@ namespace video {
     FIXED_GOP_SIZE = 1 << 12,  ///< Use fixed small GOP size (encoder doesn't support on-demand IDR frames)
   };
 
+  enum class encode_result_e {
+    error = -1,
+    submitted,
+    retry,
+  };
+
   class avcodec_encode_session_t: public encode_session_t {
   public:
     struct pending_frame_t {
@@ -353,6 +381,8 @@ namespace video {
       inject = other.inject;
       max_pending_frames = other.max_pending_frames;
       warned_about_unmatched_pts = other.warned_about_unmatched_pts;
+      warned_about_queue_saturation = other.warned_about_queue_saturation;
+      queue_saturated_since = other.queue_saturated_since;
 
       return *this;
     }
@@ -403,6 +433,10 @@ namespace video {
 
     // VideoToolbox can occasionally return AV_NOPTS_VALUE or a rewritten PTS.
     bool warned_about_unmatched_pts {};
+
+    // Track asynchronous encoder backpressure without blocking the encode loop.
+    bool warned_about_queue_saturation {};
+    std::optional<std::chrono::steady_clock::time_point> queue_saturated_since;
   };
 
   class nvenc_encode_session_t: public encode_session_t {
@@ -1630,25 +1664,35 @@ namespace video {
     return packets_received;
   }
 
-  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  encode_result_e encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     auto &frame = session.device->frame;
     auto &ctx = session.avcodec_ctx;
 
-    if (session.max_pending_frames > 0) {
-      const auto wait_started = std::chrono::steady_clock::now();
-      while (session.pending_frames.size() >= session.max_pending_frames) {
-        const int received = receive_avcodec_packets(session, packets, channel_data, true);
-        if (received < 0) {
-          return received;
-        }
-        if (received == 0) {
-          if (std::chrono::steady_clock::now() - wait_started > 2s) {
-            BOOST_LOG(error) << "Timed out waiting for an asynchronous VideoToolbox frame"sv;
-            return -1;
-          }
-          std::this_thread::sleep_for(100us);
-        }
+    // Drain completed packets before applying queue backpressure. If the
+    // encoder is temporarily full, retry with the latest captured image on the
+    // next loop instead of blocking video and input delivery for seconds.
+    const int received = receive_avcodec_packets(session, packets, channel_data, false);
+    if (received < 0) {
+      return encode_result_e::error;
+    }
+
+    const auto queue_action = detail::async_queue_action(
+      session.pending_frames.size(),
+      session.max_pending_frames,
+      session.queue_saturated_since,
+      std::chrono::steady_clock::now(),
+      500ms
+    );
+    if (queue_action == detail::async_queue_action_e::timeout) {
+      BOOST_LOG(error) << "VideoToolbox produced no output for 500ms while its HDR queue was saturated"sv;
+      return encode_result_e::error;
+    }
+    if (queue_action == detail::async_queue_action_e::retry) {
+      if (!session.warned_about_queue_saturation) {
+        BOOST_LOG(warning) << "VideoToolbox HDR queue saturated; retaining only the latest captured frame until it recovers"sv;
+        session.warned_about_queue_saturation = true;
       }
+      return encode_result_e::retry;
     }
 
     frame->pts = frame_nr;
@@ -1656,11 +1700,14 @@ namespace video {
 
     // send the frame to the encoder
     auto ret = avcodec_send_frame(ctx.get(), frame);
+    if (ret == AVERROR(EAGAIN)) {
+      return encode_result_e::retry;
+    }
     if (ret < 0) {
       char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
       BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
 
-      return -1;
+      return encode_result_e::error;
     }
 
     session.pending_frames.emplace(
@@ -1672,14 +1719,14 @@ namespace video {
     );
 
     ret = receive_avcodec_packets(session, packets, channel_data, false);
-    return ret < 0 ? ret : 0;
+    return ret < 0 ? encode_result_e::error : encode_result_e::submitted;
   }
 
-  int encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  encode_result_e encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     auto encoded_frame = session.encode_frame(frame_nr);
     if (encoded_frame.data.empty()) {
       BOOST_LOG(error) << "NvENC returned empty packet";
-      return -1;
+      return encode_result_e::error;
     }
 
     if (frame_nr != encoded_frame.frame_index) {
@@ -1692,17 +1739,17 @@ namespace video {
     packet->frame_timestamp = frame_timestamp;
     packets->raise(std::move(packet));
 
-    return 0;
+    return encode_result_e::submitted;
   }
 
-  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  encode_result_e encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
       return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
     }
 
-    return -1;
+    return encode_result_e::error;
   }
 
   std::unique_ptr<avcodec_encode_session_t> make_avcodec_encode_session(
@@ -2236,11 +2283,16 @@ namespace video {
         break;
       }
 
-      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
+      const auto encode_result = encode(frame_nr, *session, packets, channel_data, frame_timestamp);
+      if (encode_result == encode_result_e::error) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
+      if (encode_result == encode_result_e::retry) {
+        continue;
+      }
 
+      ++frame_nr;
       session->request_normal_frame();
 
       // While streaming check to see if the mouse is present and enable Mouse Keys to force the cursor to appear
@@ -2496,13 +2548,19 @@ namespace video {
             frame_timestamp = img->frame_timestamp;
           }
 
-          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
+          const auto encode_result = encode(ctx->frame_nr, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp);
+          if (encode_result == encode_result_e::error) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
 
             continue;
           }
+          if (encode_result == encode_result_e::retry) {
+            ++pos;
+            continue;
+          }
 
+          ++ctx->frame_nr;
           pos->session->request_normal_frame();
 
           ++pos;
@@ -2706,7 +2764,7 @@ namespace video {
 
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     while (!packets->peek()) {
-      if (encode(1, *session, packets, nullptr, {})) {
+      if (encode(1, *session, packets, nullptr, {}) == encode_result_e::error) {
         return -1;
       }
     }
