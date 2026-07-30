@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <cstdint>
 #include <functional>
 
 // local includes
@@ -13,6 +14,17 @@
 
 namespace input {
   struct input_t;
+
+  namespace detail {
+    /**
+     * @brief Add two signed 16-bit input deltas when the sum is representable.
+     * @param lhs The accumulated delta.
+     * @param rhs The delta to add.
+     * @param result Receives the sum when no overflow occurs.
+     * @return true when the values were added, otherwise false.
+     */
+    bool try_add_input_delta(std::int16_t lhs, std::int16_t rhs, std::int16_t &result);
+  }  // namespace detail
 
   void print(void *input);
   void reset(std::shared_ptr<input_t> &input);
