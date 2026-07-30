@@ -501,6 +501,15 @@ namespace platf {
      */
     virtual capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) = 0;
 
+    /**
+     * @brief Request that an in-progress capture call stop.
+     *
+     * Backends whose capture() implementation can block independently of frame
+     * delivery should override this method and wake the blocked capture call.
+     */
+    virtual void stop_capture() {
+    }
+
     virtual std::shared_ptr<img_t> alloc_img() = 0;
 
     virtual int dummy_img(img_t *img) = 0;

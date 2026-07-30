@@ -330,8 +330,8 @@ namespace video {
     avcodec_encode_session_t(avcodec_encode_session_t &&other) noexcept = default;
 
     ~avcodec_encode_session_t() {
-      // Flush any remaining frames in the encoder
-      if (avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
+      // Flush any remaining frames only after the encoder has accepted a frame.
+      if (avcodec_ctx && avcodec_ctx->frame_num > 0 && avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
         packet_raw_avcodec pkt;
         while (avcodec_receive_packet(avcodec_ctx.get(), pkt.av_packet) == 0);
       }
@@ -352,6 +352,7 @@ namespace video {
 
       inject = other.inject;
       max_pending_frames = other.max_pending_frames;
+      warned_about_unmatched_pts = other.warned_about_unmatched_pts;
 
       return *this;
     }
@@ -395,10 +396,13 @@ namespace video {
     std::map<int64_t, pending_frame_t> pending_frames;
 
     // inject sps/vps data into idr pictures
-    int inject;
+    int inject {};
 
     // Zero preserves the encoder's default asynchronous queue behavior.
-    std::size_t max_pending_frames;
+    std::size_t max_pending_frames {};
+
+    // VideoToolbox can occasionally return AV_NOPTS_VALUE or a rewritten PTS.
+    bool warned_about_unmatched_pts {};
   };
 
   class nvenc_encode_session_t: public encode_session_t {
@@ -1560,6 +1564,18 @@ namespace video {
       }
 
       auto pending_frame = session.pending_frames.find(av_packet->pts);
+      if (pending_frame == session.pending_frames.end() && !session.pending_frames.empty()) {
+        // Sunshine disables B-frames, so VideoToolbox output remains in input
+        // order even when it omits or rewrites a packet PTS. Retire the oldest
+        // submitted frame to prevent the bounded async queue from deadlocking.
+        pending_frame = session.pending_frames.begin();
+        if (!session.warned_about_unmatched_pts) {
+          BOOST_LOG(warning)
+            << "VideoToolbox packet PTS ["sv << av_packet->pts
+            << "] did not match a pending frame; falling back to input order"sv;
+          session.warned_about_unmatched_pts = true;
+        }
+      }
       const bool requested_idr =
         pending_frame != session.pending_frames.end() && pending_frame->second.requested_idr;
 
@@ -1626,7 +1642,7 @@ namespace video {
           return received;
         }
         if (received == 0) {
-          if (std::chrono::steady_clock::now() - wait_started > 250ms) {
+          if (std::chrono::steady_clock::now() - wait_started > 2s) {
             BOOST_LOG(error) << "Timed out waiting for an asynchronous VideoToolbox frame"sv;
             return -1;
           }
@@ -2182,17 +2198,6 @@ namespace video {
     }
 
     while (true) {
-      // Break out of the encoding loop if any of the following are true:
-      // a) The stream is ending
-      // b) Sunshine is quitting
-      // c) The capture side is waiting to reinit and we've encoded at least one frame
-      //
-      // If we have to reinit before we have received any captured frames, we will encode
-      // the blank dummy frame just to let Moonlight know that we're alive.
-      if (shutdown_event->peek() || !images->running() || (reinit_event.peek() && frame_nr > 1)) {
-        break;
-      }
-
       bool requested_idr_frame = false;
 
       while (invalidate_ref_frames_events->peek()) {
@@ -2223,6 +2228,12 @@ namespace video {
         } else if (!images->running()) {
           break;
         }
+      }
+
+      // Keep this check next to encode() so an image queue shutdown cannot
+      // race encoder teardown and leave a packet in flight.
+      if (shutdown_event->peek() || !images->running() || (reinit_event.peek() && frame_nr > 1)) {
+        break;
       }
 
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
@@ -3234,7 +3245,18 @@ namespace video {
   void end_capture_async(capture_thread_async_ctx_t &capture_thread_ctx) {
     capture_thread_ctx.capture_ctx_queue->stop();
 
-    capture_thread_ctx.capture_thread.join();
+    std::shared_ptr<platf::display_t> display;
+    {
+      auto lock = capture_thread_ctx.display_wp.lock();
+      display = capture_thread_ctx.display_wp->lock();
+    }
+    if (display) {
+      display->stop_capture();
+    }
+
+    if (capture_thread_ctx.capture_thread.joinable()) {
+      capture_thread_ctx.capture_thread.join();
+    }
   }
 
   int start_capture_sync(capture_thread_sync_ctx_t &ctx) {

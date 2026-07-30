@@ -32,6 +32,10 @@ namespace platf {
       [av_capture release];
     }
 
+    void stop_capture() override {
+      [av_capture stopCapture];
+    }
+
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);

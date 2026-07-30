@@ -38,6 +38,7 @@ typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
 @property (nonatomic, assign) dispatch_semaphore_t screenCaptureSignal;
 @property (nonatomic, assign) BOOL screenCaptureFinishing;
 @property (nonatomic, assign) BOOL screenCaptureValidated;
+@property (nonatomic, assign) BOOL captureStopRequested;
 @property (nonatomic, assign) BOOL captureFailed;
 
 + (NSArray<NSDictionary *> *)displayNames;
@@ -47,5 +48,6 @@ typedef bool (^FrameCallbackBlock)(CMSampleBufferRef);
 
 - (void)setFrameWidth:(int)frameWidth frameHeight:(int)frameHeight;
 - (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback;
+- (void)stopCapture;
 
 @end

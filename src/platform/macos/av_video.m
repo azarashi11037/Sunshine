@@ -109,6 +109,7 @@
   self.frameWidth = (int) CGDisplayModeGetPixelWidth(mode);
   self.frameHeight = (int) CGDisplayModeGetPixelHeight(mode);
   self.minFrameDuration = CMTimeMake(1, frameRate);
+  self.captureStopRequested = NO;
   CFRelease(mode);
 
   if (self.hdrCaptureEnabled) {
@@ -162,17 +163,29 @@
                                     error:(NSError *)error {
   SCStream *stream = nil;
   dispatch_semaphore_t signal = nil;
+  BOOL alreadyFinishing = NO;
 
   @synchronized(self) {
-    if (self.screenCaptureFinishing) {
-      return;
-    }
-
-    self.screenCaptureFinishing = YES;
     self.captureFailed = self.captureFailed || failed;
     self.screenFrameCallback = nil;
-    stream = [self.screenStream retain];
     signal = self.screenCaptureSignal;
+    self.screenCaptureSignal = nil;
+
+    alreadyFinishing = self.screenCaptureFinishing;
+    if (!alreadyFinishing) {
+      self.screenCaptureFinishing = YES;
+      stream = [self.screenStream retain];
+    }
+  }
+
+  // Wake display.mm immediately. ScreenCaptureKit's asynchronous stop
+  // completion can be delayed indefinitely during client disconnect.
+  if (signal) {
+    dispatch_semaphore_signal(signal);
+  }
+
+  if (alreadyFinishing) {
+    return;
   }
 
   if (error) {
@@ -188,13 +201,9 @@
       if (self.screenStream == stream) {
         self.screenStream = nil;
       }
-      self.screenCaptureSignal = nil;
       self.screenCaptureFinishing = NO;
     }
 
-    if (signal) {
-      dispatch_semaphore_signal(signal);
-    }
     [stream release];
   };
 
@@ -208,6 +217,10 @@
 - (dispatch_semaphore_t)captureHDR:(FrameCallbackBlock)frameCallback {
   if (@available(macOS 15.0, *)) {
     @synchronized(self) {
+      if (self.captureStopRequested) {
+        return nil;
+      }
+
       if (self.screenStream || self.screenCaptureFinishing) {
         self.captureFailed = YES;
         NSLog(@"Sunshine HDR: attempted to start a second ScreenCaptureKit stream");
@@ -279,6 +292,10 @@
 
 - (dispatch_semaphore_t)captureAVFoundation:(FrameCallbackBlock)frameCallback {
   @synchronized(self) {
+    if (self.captureStopRequested) {
+      return nil;
+    }
+
     self.captureFailed = NO;
     AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
 
@@ -317,6 +334,16 @@
 
 - (dispatch_semaphore_t)capture:(FrameCallbackBlock)frameCallback {
   return self.hdrCaptureEnabled ? [self captureHDR:frameCallback] : [self captureAVFoundation:frameCallback];
+}
+
+- (void)stopCapture {
+  @synchronized(self) {
+    self.captureStopRequested = YES;
+  }
+
+  if (self.hdrCaptureEnabled) {
+    [self finishScreenCaptureStoppingStream:YES failed:NO error:nil];
+  }
 }
 
 - (void)captureOutput:(AVCaptureOutput *)captureOutput
