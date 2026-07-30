@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <cstring>
+#include <mutex>
 
 // local includes
 #include "src/config.h"
@@ -24,6 +25,21 @@ namespace fs = std::filesystem;
 namespace platf {
   using namespace std::literals;
 
+  struct capture_callback_context_t {
+    capture_callback_context_t(
+      const display_t::push_captured_image_cb_t &push_callback,
+      const display_t::pull_free_image_cb_t &pull_callback
+    ):
+        push_callback {push_callback},
+        pull_callback {pull_callback} {
+    }
+
+    std::mutex mutex;
+    bool active {true};
+    display_t::push_captured_image_cb_t push_callback;
+    display_t::pull_free_image_cb_t pull_callback;
+  };
+
   struct av_display_t: public display_t {
     AVVideo *av_capture {};
     CGDirectDisplayID display_id {};
@@ -37,12 +53,26 @@ namespace platf {
     }
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+      // ScreenCaptureKit can deliver a frame after stopCapture() has signalled
+      // the waiting capture thread. Keep callback invocation serialized with
+      // capture() teardown so a late frame can never call C++ closures whose
+      // capture-thread stack has already been destroyed.
+      auto callbacks = std::make_shared<capture_callback_context_t>(
+        push_captured_image_cb,
+        pull_free_image_cb
+      );
+
       auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+        std::lock_guard<std::mutex> lock {callbacks->mutex};
+        if (!callbacks->active) {
+          return false;
+        }
+
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
         auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
 
         std::shared_ptr<img_t> img_out;
-        if (!pull_free_image_cb(img_out)) {
+        if (!callbacks->pull_callback(img_out)) {
           // got interrupt signal
           // returning false here stops capture backend
           return false;
@@ -66,7 +96,7 @@ namespace platf {
 
         old_data_retainer = nullptr;
 
-        if (!push_captured_image_cb(std::move(img_out), true)) {
+        if (!callbacks->push_callback(std::move(img_out), true)) {
           // got interrupt signal
           // returning false here stops capture backend
           return false;
@@ -81,6 +111,13 @@ namespace platf {
 
       // FIXME: We should time out if an image isn't returned for a while
       dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
+
+      {
+        std::lock_guard<std::mutex> lock {callbacks->mutex};
+        callbacks->active = false;
+        callbacks->push_callback = {};
+        callbacks->pull_callback = {};
+      }
 
       return av_capture.captureFailed ? capture_e::error : capture_e::ok;
     }
