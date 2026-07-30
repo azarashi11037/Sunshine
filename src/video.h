@@ -28,6 +28,7 @@ namespace video {
     enum class async_queue_action_e {
       submit,
       expand,
+      contract,
       retry,
       timeout,
     };
@@ -35,17 +36,22 @@ namespace video {
     /**
      * @brief Decide whether an asynchronous encoder can accept another frame.
      *
-     * A saturated queue may grow to its bounded maximum, but must never block
-     * the capture/encode loop. At the maximum, the caller retries with its
-     * latest frame until the encoder makes progress, while a sustained lack of
-     * output is still treated as an encoder failure.
+     * A saturated queue grows one frame at a time after a short grace period,
+     * while sustained headroom contracts it toward the configured minimum.
+     * The capture/encode loop must never block. At the maximum, the caller
+     * retries with its latest frame until the encoder makes progress, while a
+     * sustained lack of output is still treated as an encoder failure.
      */
     async_queue_action_e async_queue_action(
       std::size_t pending_frames,
+      std::size_t min_pending_frames,
       std::size_t &pending_frame_limit,
       std::size_t max_pending_frames,
       std::optional<std::chrono::steady_clock::time_point> &saturated_since,
+      std::optional<std::chrono::steady_clock::time_point> &headroom_since,
       std::chrono::steady_clock::time_point now,
+      std::chrono::steady_clock::duration expand_after,
+      std::chrono::steady_clock::duration contract_after,
       std::chrono::steady_clock::duration timeout
     );
   }  // namespace detail

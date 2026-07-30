@@ -8,87 +8,112 @@
 
 using namespace std::chrono_literals;
 
+namespace {
+  struct async_queue_test_state_t {
+    std::size_t min_pending_frames {2};
+    std::size_t pending_frame_limit {2};
+    std::size_t max_pending_frames {8};
+    std::optional<std::chrono::steady_clock::time_point> saturated_since;
+    std::optional<std::chrono::steady_clock::time_point> headroom_since;
+    std::chrono::steady_clock::duration expand_after {20ms};
+    std::chrono::steady_clock::duration contract_after {1s};
+    std::chrono::steady_clock::duration timeout {500ms};
+
+    video::detail::async_queue_action_e decide(
+      std::size_t pending_frames,
+      std::chrono::steady_clock::time_point now
+    ) {
+      return video::detail::async_queue_action(
+        pending_frames,
+        min_pending_frames,
+        pending_frame_limit,
+        max_pending_frames,
+        saturated_since,
+        headroom_since,
+        now,
+        expand_after,
+        contract_after,
+        timeout
+      );
+    }
+  };
+}  // namespace
+
 TEST(AsyncQueueBackpressureTest, AllowsUnlimitedOrAvailableQueue) {
-  std::optional<std::chrono::steady_clock::time_point> saturated_since;
-  std::size_t pending_frame_limit = 0;
+  async_queue_test_state_t state;
   const auto now = std::chrono::steady_clock::time_point {} + 1s;
 
-  EXPECT_EQ(
-    video::detail::async_queue_action(100, pending_frame_limit, 0, saturated_since, now, 500ms),
-    video::detail::async_queue_action_e::submit
-  );
-  pending_frame_limit = 4;
-  EXPECT_EQ(
-    video::detail::async_queue_action(3, pending_frame_limit, 8, saturated_since, now, 500ms),
-    video::detail::async_queue_action_e::submit
-  );
-  EXPECT_FALSE(saturated_since.has_value());
+  state.min_pending_frames = 0;
+  state.pending_frame_limit = 0;
+  state.max_pending_frames = 0;
+  EXPECT_EQ(state.decide(100, now), video::detail::async_queue_action_e::submit);
+
+  state = {};
+  EXPECT_EQ(state.decide(1, now), video::detail::async_queue_action_e::submit);
+  EXPECT_FALSE(state.saturated_since.has_value());
+  EXPECT_FALSE(state.headroom_since.has_value());
 }
 
-TEST(AsyncQueueBackpressureTest, ExpandsWithinBoundBeforeRetrying) {
-  std::optional<std::chrono::steady_clock::time_point> saturated_since;
-  std::size_t pending_frame_limit = 4;
+TEST(AsyncQueueBackpressureTest, ExpandsGraduallyAfterPressureGrace) {
+  async_queue_test_state_t state;
   const auto now = std::chrono::steady_clock::time_point {} + 1s;
 
-  EXPECT_EQ(
-    video::detail::async_queue_action(4, pending_frame_limit, 8, saturated_since, now, 500ms),
-    video::detail::async_queue_action_e::expand
-  );
-  EXPECT_EQ(pending_frame_limit, 8);
-  EXPECT_FALSE(saturated_since.has_value());
+  EXPECT_EQ(state.decide(2, now), video::detail::async_queue_action_e::retry);
+  EXPECT_EQ(state.pending_frame_limit, 2);
+  ASSERT_TRUE(state.saturated_since.has_value());
+  EXPECT_EQ(state.decide(2, now + 19ms), video::detail::async_queue_action_e::retry);
+  EXPECT_EQ(state.decide(2, now + 20ms), video::detail::async_queue_action_e::expand);
+  EXPECT_EQ(state.pending_frame_limit, 3);
+  EXPECT_FALSE(state.saturated_since.has_value());
 }
 
-TEST(AsyncQueueBackpressureTest, RetriesWithoutBlockingWhenFull) {
-  std::optional<std::chrono::steady_clock::time_point> saturated_since;
-  std::size_t pending_frame_limit = 8;
+TEST(AsyncQueueBackpressureTest, ContractsOneFrameAfterStableHeadroom) {
+  async_queue_test_state_t state;
+  state.pending_frame_limit = 5;
   const auto now = std::chrono::steady_clock::time_point {} + 1s;
 
-  EXPECT_EQ(
-    video::detail::async_queue_action(8, pending_frame_limit, 8, saturated_since, now, 500ms),
-    video::detail::async_queue_action_e::retry
-  );
-  ASSERT_TRUE(saturated_since.has_value());
-  EXPECT_EQ(*saturated_since, now);
-  EXPECT_EQ(
-    video::detail::async_queue_action(8, pending_frame_limit, 8, saturated_since, now + 499ms, 500ms),
-    video::detail::async_queue_action_e::retry
-  );
+  EXPECT_EQ(state.decide(4, now), video::detail::async_queue_action_e::submit);
+  ASSERT_TRUE(state.headroom_since.has_value());
+  EXPECT_EQ(state.decide(4, now + 999ms), video::detail::async_queue_action_e::submit);
+  EXPECT_EQ(state.decide(4, now + 1s), video::detail::async_queue_action_e::contract);
+  EXPECT_EQ(state.pending_frame_limit, 4);
+  EXPECT_FALSE(state.saturated_since.has_value());
 }
 
-TEST(AsyncQueueBackpressureTest, TimesOutOnlyAfterSustainedStall) {
-  std::optional<std::chrono::steady_clock::time_point> saturated_since;
-  std::size_t pending_frame_limit = 8;
+TEST(AsyncQueueBackpressureTest, NeverContractsBelowMinimum) {
+  async_queue_test_state_t state;
   const auto now = std::chrono::steady_clock::time_point {} + 1s;
 
-  EXPECT_EQ(
-    video::detail::async_queue_action(8, pending_frame_limit, 8, saturated_since, now, 500ms),
-    video::detail::async_queue_action_e::retry
-  );
-  EXPECT_EQ(
-    video::detail::async_queue_action(8, pending_frame_limit, 8, saturated_since, now + 500ms, 500ms),
-    video::detail::async_queue_action_e::timeout
-  );
+  EXPECT_EQ(state.decide(1, now), video::detail::async_queue_action_e::submit);
+  EXPECT_EQ(state.decide(1, now + 5s), video::detail::async_queue_action_e::submit);
+  EXPECT_EQ(state.pending_frame_limit, 2);
+  EXPECT_FALSE(state.headroom_since.has_value());
 }
 
-TEST(AsyncQueueBackpressureTest, ProgressResetsStallWindow) {
-  std::optional<std::chrono::steady_clock::time_point> saturated_since;
-  std::size_t pending_frame_limit = 8;
+TEST(AsyncQueueBackpressureTest, TimesOutOnlyAtMaximumAfterSustainedStall) {
+  async_queue_test_state_t state;
+  state.pending_frame_limit = 8;
   const auto now = std::chrono::steady_clock::time_point {} + 1s;
 
-  EXPECT_EQ(
-    video::detail::async_queue_action(8, pending_frame_limit, 8, saturated_since, now, 500ms),
-    video::detail::async_queue_action_e::retry
-  );
-  EXPECT_EQ(
-    video::detail::async_queue_action(7, pending_frame_limit, 8, saturated_since, now + 400ms, 500ms),
-    video::detail::async_queue_action_e::submit
-  );
-  EXPECT_FALSE(saturated_since.has_value());
-  EXPECT_EQ(
-    video::detail::async_queue_action(8, pending_frame_limit, 8, saturated_since, now + 600ms, 500ms),
-    video::detail::async_queue_action_e::retry
-  );
-  EXPECT_EQ(*saturated_since, now + 600ms);
+  EXPECT_EQ(state.decide(8, now), video::detail::async_queue_action_e::retry);
+  ASSERT_TRUE(state.saturated_since.has_value());
+  EXPECT_EQ(*state.saturated_since, now);
+  EXPECT_EQ(state.decide(8, now + 499ms), video::detail::async_queue_action_e::retry);
+  EXPECT_EQ(state.decide(8, now + 500ms), video::detail::async_queue_action_e::timeout);
+}
+
+TEST(AsyncQueueBackpressureTest, ProgressResetsPressureAndContractionWindows) {
+  async_queue_test_state_t state;
+  state.pending_frame_limit = 5;
+  const auto now = std::chrono::steady_clock::time_point {} + 1s;
+
+  EXPECT_EQ(state.decide(5, now), video::detail::async_queue_action_e::retry);
+  EXPECT_EQ(state.decide(4, now + 10ms), video::detail::async_queue_action_e::submit);
+  EXPECT_FALSE(state.saturated_since.has_value());
+  ASSERT_TRUE(state.headroom_since.has_value());
+  EXPECT_EQ(state.decide(5, now + 100ms), video::detail::async_queue_action_e::retry);
+  EXPECT_FALSE(state.headroom_since.has_value());
+  EXPECT_EQ(*state.saturated_since, now + 100ms);
 }
 
 struct EncoderTest: PlatformTestSuite, testing::WithParamInterface<video::encoder_t *> {

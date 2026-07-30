@@ -44,29 +44,55 @@ namespace video {
 
   detail::async_queue_action_e detail::async_queue_action(
     std::size_t pending_frames,
+    std::size_t min_pending_frames,
     std::size_t &pending_frame_limit,
     std::size_t max_pending_frames,
     std::optional<std::chrono::steady_clock::time_point> &saturated_since,
+    std::optional<std::chrono::steady_clock::time_point> &headroom_since,
     std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::duration expand_after,
+    std::chrono::steady_clock::duration contract_after,
     std::chrono::steady_clock::duration timeout
   ) {
     if (max_pending_frames == 0) {
       saturated_since.reset();
+      headroom_since.reset();
       return async_queue_action_e::submit;
     }
 
     if (pending_frames < pending_frame_limit) {
       saturated_since.reset();
+
+      if (pending_frame_limit > min_pending_frames) {
+        if (!headroom_since) {
+          headroom_since = now;
+        } else if (now - *headroom_since >= contract_after) {
+          --pending_frame_limit;
+          headroom_since = now;
+          return async_queue_action_e::contract;
+        }
+      } else {
+        headroom_since.reset();
+      }
+
       return async_queue_action_e::submit;
     }
 
+    headroom_since.reset();
+
     if (pending_frame_limit < max_pending_frames) {
-      pending_frame_limit = std::min(
-        max_pending_frames,
-        std::max(pending_frame_limit + 1, pending_frame_limit * 2)
-      );
-      saturated_since.reset();
-      return async_queue_action_e::expand;
+      if (!saturated_since) {
+        saturated_since = now;
+        return async_queue_action_e::retry;
+      }
+
+      if (now - *saturated_since >= expand_after) {
+        ++pending_frame_limit;
+        saturated_since.reset();
+        return async_queue_action_e::expand;
+      }
+
+      return async_queue_action_e::retry;
     }
 
     if (!saturated_since) {
@@ -362,14 +388,20 @@ namespace video {
       avcodec_ctx_t &&avcodec_ctx,
       std::unique_ptr<platf::avcodec_encode_device_t> encode_device,
       int inject,
+      std::size_t min_pending_frames,
       std::size_t pending_frame_limit,
-      std::size_t max_pending_frames
+      std::size_t max_pending_frames,
+      std::chrono::steady_clock::duration queue_expand_delay,
+      std::chrono::steady_clock::duration queue_contract_delay
     ):
         avcodec_ctx {std::move(avcodec_ctx)},
         device {std::move(encode_device)},
         inject {inject},
+        min_pending_frames {min_pending_frames},
         pending_frame_limit {pending_frame_limit},
-        max_pending_frames {max_pending_frames} {
+        max_pending_frames {max_pending_frames},
+        queue_expand_delay {queue_expand_delay},
+        queue_contract_delay {queue_contract_delay} {
     }
 
     avcodec_encode_session_t(avcodec_encode_session_t &&other) noexcept = default;
@@ -396,11 +428,15 @@ namespace video {
       pending_frames = std::move(other.pending_frames);
 
       inject = other.inject;
+      min_pending_frames = other.min_pending_frames;
       pending_frame_limit = other.pending_frame_limit;
       max_pending_frames = other.max_pending_frames;
+      queue_expand_delay = other.queue_expand_delay;
+      queue_contract_delay = other.queue_contract_delay;
       warned_about_unmatched_pts = other.warned_about_unmatched_pts;
       warned_about_queue_saturation = other.warned_about_queue_saturation;
       queue_saturated_since = other.queue_saturated_since;
+      queue_headroom_since = other.queue_headroom_since;
 
       return *this;
     }
@@ -446,11 +482,18 @@ namespace video {
     // inject sps/vps data into idr pictures
     int inject {};
 
+    // The queue contracts toward this latency-oriented floor after warm-up.
+    std::size_t min_pending_frames {};
+
     // The active limit may grow under load up to max_pending_frames.
     std::size_t pending_frame_limit {};
 
     // Zero preserves the encoder's default asynchronous queue behavior.
     std::size_t max_pending_frames {};
+
+    // Hysteresis avoids expanding for momentary pressure or oscillating limits.
+    std::chrono::steady_clock::duration queue_expand_delay {};
+    std::chrono::steady_clock::duration queue_contract_delay {};
 
     // VideoToolbox can occasionally return AV_NOPTS_VALUE or a rewritten PTS.
     bool warned_about_unmatched_pts {};
@@ -458,6 +501,7 @@ namespace video {
     // Track asynchronous encoder backpressure without blocking the encode loop.
     bool warned_about_queue_saturation {};
     std::optional<std::chrono::steady_clock::time_point> queue_saturated_since;
+    std::optional<std::chrono::steady_clock::time_point> queue_headroom_since;
   };
 
   class nvenc_encode_session_t: public encode_session_t {
@@ -1699,10 +1743,14 @@ namespace video {
 
     const auto queue_action = detail::async_queue_action(
       session.pending_frames.size(),
+      session.min_pending_frames,
       session.pending_frame_limit,
       session.max_pending_frames,
       session.queue_saturated_since,
+      session.queue_headroom_since,
       std::chrono::steady_clock::now(),
+      session.queue_expand_delay,
+      session.queue_contract_delay,
       500ms
     );
     if (queue_action == detail::async_queue_action_e::timeout) {
@@ -1717,8 +1765,16 @@ namespace video {
         << "Expanding asynchronous VideoToolbox HDR queue to "sv
         << session.pending_frame_limit << " frames under load"sv;
     }
+    if (queue_action == detail::async_queue_action_e::contract) {
+      session.warned_about_queue_saturation = false;
+      BOOST_LOG(info)
+        << "Contracting asynchronous VideoToolbox HDR queue to "sv
+        << session.pending_frame_limit << " frames after stable output"sv;
+      return encode_result_e::retry;
+    }
     if (queue_action == detail::async_queue_action_e::retry) {
-      if (!session.warned_about_queue_saturation) {
+      if (session.pending_frame_limit == session.max_pending_frames &&
+          !session.warned_about_queue_saturation) {
         BOOST_LOG(warning) << "VideoToolbox HDR queue saturated; retaining only the latest captured frame until it recovers"sv;
         session.warned_about_queue_saturation = true;
       }
@@ -2158,24 +2214,38 @@ namespace video {
 
     encode_device_final->apply_colorspace();
 
+    std::size_t min_pending_frames = 0;
     std::size_t pending_frame_limit = 0;
     std::size_t max_pending_frames = 0;
+    std::chrono::steady_clock::duration queue_expand_delay {};
+    std::chrono::steady_clock::duration queue_contract_delay {};
 #ifdef __APPLE__
     if (encoder.name == "videotoolbox"sv && config.videoFormat == 1 && config.dynamicRange) {
-      // Start with the four frames needed to sustain the normal HDR pipeline,
-      // then allow a bounded in-flight window of roughly 67 ms for transient
-      // complex frames. At 120 FPS this expands to eight frames while leaving
-      // space in the twelve-frame capture pool.
-      pending_frame_limit = 4;
+      // Start at two in-flight frames for low input-to-photon latency. Grow one
+      // frame at a time only after sustained pressure, then probe back toward
+      // the floor after stable output. At 120 FPS the bounded maximum remains
+      // eight frames, leaving space in the twelve-frame capture pool.
+      min_pending_frames = 2;
+      pending_frame_limit = min_pending_frames;
       max_pending_frames = std::clamp<std::size_t>(
         (std::max(config.framerate, 1) + 14) / 15,
-        pending_frame_limit,
+        min_pending_frames,
         8
       );
+      queue_expand_delay = std::clamp(
+        2000ms / std::max(config.framerate, 1),
+        8ms,
+        33ms
+      );
+      queue_contract_delay = 1s;
       BOOST_LOG(info)
-        << "Starting asynchronous VideoToolbox HDR queue at "sv
-        << pending_frame_limit << " frames (adaptive maximum "sv
-        << max_pending_frames << ")"sv;
+        << "Starting latency-adaptive VideoToolbox HDR queue in range "sv
+        << min_pending_frames << "-"sv << max_pending_frames
+        << " frames (expansion grace "sv
+        << std::chrono::duration_cast<std::chrono::milliseconds>(queue_expand_delay).count()
+        << "ms, contraction interval "sv
+        << std::chrono::duration_cast<std::chrono::milliseconds>(queue_contract_delay).count()
+        << "ms)"sv;
     }
 #endif
 
@@ -2185,8 +2255,11 @@ namespace video {
 
       // 0 ==> don't inject, 1 ==> inject for h264, 2 ==> inject for hevc
       config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0,
+      min_pending_frames,
       pending_frame_limit,
-      max_pending_frames
+      max_pending_frames,
+      queue_expand_delay,
+      queue_contract_delay
     );
 
     return session;
