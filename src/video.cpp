@@ -44,14 +44,29 @@ namespace video {
 
   detail::async_queue_action_e detail::async_queue_action(
     std::size_t pending_frames,
+    std::size_t &pending_frame_limit,
     std::size_t max_pending_frames,
     std::optional<std::chrono::steady_clock::time_point> &saturated_since,
     std::chrono::steady_clock::time_point now,
     std::chrono::steady_clock::duration timeout
   ) {
-    if (max_pending_frames == 0 || pending_frames < max_pending_frames) {
+    if (max_pending_frames == 0) {
       saturated_since.reset();
       return async_queue_action_e::submit;
+    }
+
+    if (pending_frames < pending_frame_limit) {
+      saturated_since.reset();
+      return async_queue_action_e::submit;
+    }
+
+    if (pending_frame_limit < max_pending_frames) {
+      pending_frame_limit = std::min(
+        max_pending_frames,
+        std::max(pending_frame_limit + 1, pending_frame_limit * 2)
+      );
+      saturated_since.reset();
+      return async_queue_action_e::expand;
     }
 
     if (!saturated_since) {
@@ -347,11 +362,13 @@ namespace video {
       avcodec_ctx_t &&avcodec_ctx,
       std::unique_ptr<platf::avcodec_encode_device_t> encode_device,
       int inject,
+      std::size_t pending_frame_limit,
       std::size_t max_pending_frames
     ):
         avcodec_ctx {std::move(avcodec_ctx)},
         device {std::move(encode_device)},
         inject {inject},
+        pending_frame_limit {pending_frame_limit},
         max_pending_frames {max_pending_frames} {
     }
 
@@ -379,6 +396,7 @@ namespace video {
       pending_frames = std::move(other.pending_frames);
 
       inject = other.inject;
+      pending_frame_limit = other.pending_frame_limit;
       max_pending_frames = other.max_pending_frames;
       warned_about_unmatched_pts = other.warned_about_unmatched_pts;
       warned_about_queue_saturation = other.warned_about_queue_saturation;
@@ -427,6 +445,9 @@ namespace video {
 
     // inject sps/vps data into idr pictures
     int inject {};
+
+    // The active limit may grow under load up to max_pending_frames.
+    std::size_t pending_frame_limit {};
 
     // Zero preserves the encoder's default asynchronous queue behavior.
     std::size_t max_pending_frames {};
@@ -1678,14 +1699,23 @@ namespace video {
 
     const auto queue_action = detail::async_queue_action(
       session.pending_frames.size(),
+      session.pending_frame_limit,
       session.max_pending_frames,
       session.queue_saturated_since,
       std::chrono::steady_clock::now(),
       500ms
     );
     if (queue_action == detail::async_queue_action_e::timeout) {
-      BOOST_LOG(error) << "VideoToolbox produced no output for 500ms while its HDR queue was saturated"sv;
+      BOOST_LOG(error)
+        << "VideoToolbox produced no output for 500ms while its HDR queue was saturated at "sv
+        << session.pending_frame_limit << " frames"sv;
       return encode_result_e::error;
+    }
+    if (queue_action == detail::async_queue_action_e::expand) {
+      session.warned_about_queue_saturation = false;
+      BOOST_LOG(info)
+        << "Expanding asynchronous VideoToolbox HDR queue to "sv
+        << session.pending_frame_limit << " frames under load"sv;
     }
     if (queue_action == detail::async_queue_action_e::retry) {
       if (!session.warned_about_queue_saturation) {
@@ -1693,6 +1723,9 @@ namespace video {
         session.warned_about_queue_saturation = true;
       }
       return encode_result_e::retry;
+    }
+    if (queue_action == detail::async_queue_action_e::submit) {
+      session.warned_about_queue_saturation = false;
     }
 
     frame->pts = frame_nr;
@@ -2125,14 +2158,24 @@ namespace video {
 
     encode_device_final->apply_colorspace();
 
+    std::size_t pending_frame_limit = 0;
     std::size_t max_pending_frames = 0;
 #ifdef __APPLE__
     if (encoder.name == "videotoolbox"sv && config.videoFormat == 1 && config.dynamicRange) {
-      // Four in-flight HEVC Main10 frames are the minimum that sustain 120 FPS
-      // at 2732x2048 on M2 Pro while bounding VideoToolbox's asynchronous queue.
-      max_pending_frames = 4;
-      BOOST_LOG(info) << "Limiting asynchronous VideoToolbox HDR queue to "sv
-                      << max_pending_frames << " frames"sv;
+      // Start with the four frames needed to sustain the normal HDR pipeline,
+      // then allow a bounded in-flight window of roughly 67 ms for transient
+      // complex frames. At 120 FPS this expands to eight frames while leaving
+      // space in the twelve-frame capture pool.
+      pending_frame_limit = 4;
+      max_pending_frames = std::clamp<std::size_t>(
+        (std::max(config.framerate, 1) + 14) / 15,
+        pending_frame_limit,
+        8
+      );
+      BOOST_LOG(info)
+        << "Starting asynchronous VideoToolbox HDR queue at "sv
+        << pending_frame_limit << " frames (adaptive maximum "sv
+        << max_pending_frames << ")"sv;
     }
 #endif
 
@@ -2142,6 +2185,7 @@ namespace video {
 
       // 0 ==> don't inject, 1 ==> inject for h264, 2 ==> inject for hevc
       config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0,
+      pending_frame_limit,
       max_pending_frames
     );
 
