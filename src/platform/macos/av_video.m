@@ -146,10 +146,15 @@
   self.screenFrameCallback = nil;
   [self.screenStream release];
   [self.screenContentFilter release];
+
+  for (AVCaptureVideoDataOutput *videoOutput in [self.videoOutputs objectEnumerator]) {
+    [videoOutput setSampleBufferDelegate:nil queue:nil];
+  }
+  [self.session stopRunning];
+
   [self.videoOutputs release];
   [self.captureCallbacks release];
   [self.captureSignals release];
-  [self.session stopRunning];
   [super dealloc];
 }
 
@@ -336,32 +341,76 @@
   return self.hdrCaptureEnabled ? [self captureHDR:frameCallback] : [self captureAVFoundation:frameCallback];
 }
 
+- (void)finishAVFoundationCaptureConnection:(AVCaptureConnection *)connection failed:(BOOL)failed {
+  // Removing an output can release the last owner of this delegate. Keep self
+  // alive until all state is detached and the waiting C++ thread is signalled.
+  [self retain];
+
+  dispatch_semaphore_t signal = nil;
+  @synchronized(self) {
+    self.captureFailed = self.captureFailed || failed;
+
+    AVCaptureVideoDataOutput *videoOutput = [self.videoOutputs objectForKey:connection];
+    signal = [self.captureSignals objectForKey:connection];
+
+    if (videoOutput) {
+      [self.session stopRunning];
+      [videoOutput setSampleBufferDelegate:nil queue:nil];
+    }
+
+    [self.captureCallbacks removeObjectForKey:connection];
+    if (videoOutput) {
+      [self.session removeOutput:videoOutput];
+    }
+    [self.videoOutputs removeObjectForKey:connection];
+    [self.captureSignals removeObjectForKey:connection];
+
+    if (videoOutput && !self.captureStopRequested) {
+      [self.session startRunning];
+    }
+  }
+
+  if (signal) {
+    dispatch_semaphore_signal(signal);
+  }
+
+  [self release];
+}
+
 - (void)stopCapture {
+  NSArray<AVCaptureConnection *> *connections = nil;
   @synchronized(self) {
     self.captureStopRequested = YES;
+    if (!self.hdrCaptureEnabled) {
+      connections = [[[self.captureCallbacks keyEnumerator] allObjects] retain];
+    }
   }
 
   if (self.hdrCaptureEnabled) {
     [self finishScreenCaptureStoppingStream:YES failed:NO error:nil];
+    return;
   }
+
+  for (AVCaptureConnection *connection in connections) {
+    [self finishAVFoundationCaptureConnection:connection failed:NO];
+  }
+  [connections release];
 }
 
 - (void)captureOutput:(AVCaptureOutput *)captureOutput
   didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
          fromConnection:(AVCaptureConnection *)connection {
-  FrameCallbackBlock callback = [self.captureCallbacks objectForKey:connection];
+  FrameCallbackBlock callback = nil;
+  @synchronized(self) {
+    callback = [[self.captureCallbacks objectForKey:connection] copy];
+  }
 
   if (callback != nil) {
-    if (!callback(sampleBuffer)) {
-      @synchronized(self) {
-        [self.session stopRunning];
-        [self.captureCallbacks removeObjectForKey:connection];
-        [self.session removeOutput:[self.videoOutputs objectForKey:connection]];
-        [self.videoOutputs removeObjectForKey:connection];
-        dispatch_semaphore_signal([self.captureSignals objectForKey:connection]);
-        [self.captureSignals removeObjectForKey:connection];
-        [self.session startRunning];
-      }
+    const BOOL keepCapturing = callback(sampleBuffer);
+    [callback release];
+
+    if (!keepCapturing) {
+      [self finishAVFoundationCaptureConnection:connection failed:NO];
     }
   }
 }

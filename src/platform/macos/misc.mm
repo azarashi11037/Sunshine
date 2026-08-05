@@ -12,6 +12,7 @@
 #include <charconv>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <optional>
 
 // platform includes
 #include <arpa/inet.h>
@@ -95,19 +96,34 @@ namespace platf {
     const bool is_numeric_selector =
       numeric_result.ec == std::errc {} && numeric_result.ptr == selector.data() + selector.size();
 
-    constexpr uint32_t max_displays = 32;
-    CGDirectDisplayID active_displays[max_displays] {};
-    uint32_t display_count {};
-    if (CGGetActiveDisplayList(max_displays, active_displays, &display_count) != kCGErrorSuccess) {
-      return fallback;
+    auto find_matching_display = [&](auto get_display_list) -> std::optional<CGDirectDisplayID> {
+      constexpr uint32_t max_displays = 32;
+      CGDirectDisplayID displays[max_displays] {};
+      uint32_t display_count {};
+      if (get_display_list(max_displays, displays, &display_count) != kCGErrorSuccess) {
+        return std::nullopt;
+      }
+
+      for (uint32_t index = 0; index < display_count; ++index) {
+        const auto display_id = displays[index];
+        if ((is_numeric_selector && display_id == numeric_display_id) ||
+            (!is_numeric_selector && selector == display_uuid_selector(display_id))) {
+          return display_id;
+        }
+      }
+
+      return std::nullopt;
+    };
+
+    if (const auto active_display = find_matching_display(CGGetActiveDisplayList)) {
+      return *active_display;
     }
 
-    for (uint32_t index = 0; index < display_count; ++index) {
-      const auto display_id = active_displays[index];
-      if ((is_numeric_selector && display_id == numeric_display_id) ||
-          (!is_numeric_selector && selector == display_uuid_selector(display_id))) {
-        return display_id;
-      }
+    // Sleeping virtual displays remain online but disappear from the active
+    // list. Resolve them here so stable UUID selectors do not fall back to an
+    // unrelated main display while the wake request is still completing.
+    if (const auto online_display = find_matching_display(CGGetOnlineDisplayList)) {
+      return *online_display;
     }
 
     return fallback;

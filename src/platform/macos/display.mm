@@ -3,8 +3,13 @@
  * @brief Definitions for display capture on macOS.
  */
 // standard includes
+#include <charconv>
 #include <cstring>
 #include <mutex>
+#include <thread>
+
+// platform includes
+#include <IOKit/pwr_mgt/IOPMLib.h>
 
 // local includes
 #include "src/config.h"
@@ -25,6 +30,75 @@ namespace fs = std::filesystem;
 namespace platf {
   using namespace std::literals;
 
+  namespace {
+    bool display_selector_is_active(std::string_view selector) {
+      CGDirectDisplayID active_displays[kMaxDisplays] {};
+      uint32_t display_count {};
+      if (CGGetActiveDisplayList(kMaxDisplays, active_displays, &display_count) != kCGErrorSuccess) {
+        return false;
+      }
+
+      if (selector.empty()) {
+        return display_count > 0;
+      }
+
+      CGDirectDisplayID numeric_display_id {};
+      const auto numeric_result = std::from_chars(
+        selector.data(),
+        selector.data() + selector.size(),
+        numeric_display_id
+      );
+      const bool is_numeric_selector =
+        numeric_result.ec == std::errc {} && numeric_result.ptr == selector.data() + selector.size();
+
+      for (uint32_t index = 0; index < display_count; ++index) {
+        const auto display_id = active_displays[index];
+        if ((is_numeric_selector && display_id == numeric_display_id) ||
+            (!is_numeric_selector && selector == display_uuid_selector(display_id))) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    void wake_display_for_capture(std::string_view selector) {
+      if (display_selector_is_active(selector)) {
+        return;
+      }
+
+      IOPMAssertionID wake_assertion = kIOPMNullAssertionID;
+      const auto result = IOPMAssertionDeclareUserActivity(
+        CFSTR("Sunshine display detection"),
+        kIOPMUserActiveRemote,
+        &wake_assertion
+      );
+
+      if (result != kIOReturnSuccess) {
+        BOOST_LOG(warning) << "Unable to declare remote user activity to wake displays, IOReturn: "sv << result;
+        return;
+      }
+
+      BOOST_LOG(info) << "Declared remote user activity to wake displays"sv;
+
+      for (int attempt = 0; attempt < 30 && !display_selector_is_active(selector); ++attempt) {
+        std::this_thread::sleep_for(100ms);
+      }
+
+      if (!display_selector_is_active(selector)) {
+        BOOST_LOG(warning) << "Display wake attempt did not expose the requested display ["sv
+                           << selector << "] in the active display list."sv;
+      }
+
+      if (wake_assertion != kIOPMNullAssertionID) {
+        const auto release_result = IOPMAssertionRelease(wake_assertion);
+        if (release_result != kIOReturnSuccess) {
+          BOOST_LOG(warning) << "Unable to release display wake assertion, IOReturn: "sv << release_result;
+        }
+      }
+    }
+  }  // namespace
+
   struct capture_callback_context_t {
     capture_callback_context_t(
       const display_t::push_captured_image_cb_t &push_callback,
@@ -40,12 +114,51 @@ namespace platf {
     display_t::pull_free_image_cb_t pull_callback;
   };
 
+  struct dummy_capture_context_t {
+    explicit dummy_capture_context_t(img_t *image):
+        image {image} {
+    }
+
+    std::mutex mutex;
+    bool active {true};
+    img_t *image;
+  };
+
   struct av_display_t: public display_t {
     AVVideo *av_capture {};
     CGDirectDisplayID display_id {};
+    IOPMAssertionID display_sleep_assertion {kIOPMNullAssertionID};
 
     ~av_display_t() override {
       [av_capture release];
+
+      if (display_sleep_assertion != kIOPMNullAssertionID) {
+        const auto result = IOPMAssertionRelease(display_sleep_assertion);
+        if (result != kIOReturnSuccess) {
+          BOOST_LOG(warning) << "Unable to release display sleep assertion, IOReturn: "sv << result;
+        }
+      }
+    }
+
+    void prevent_display_sleep() {
+      if (display_sleep_assertion != kIOPMNullAssertionID) {
+        return;
+      }
+
+      const auto result = IOPMAssertionCreateWithName(
+        kIOPMAssertPreventUserIdleDisplaySleep,
+        kIOPMAssertionLevelOn,
+        CFSTR("Sunshine display capture"),
+        &display_sleep_assertion
+      );
+
+      if (result == kIOReturnSuccess) {
+        BOOST_LOG(debug) << "Keeping display awake for capture"sv;
+        return;
+      }
+
+      display_sleep_assertion = kIOPMNullAssertionID;
+      BOOST_LOG(warning) << "Unable to create display sleep prevention assertion, IOReturn: "sv << result;
     }
 
     void stop_capture() override {
@@ -151,26 +264,33 @@ namespace platf {
         return 1;
       }
 
+      auto capture_context = std::make_shared<dummy_capture_context_t>(img);
       auto signal = [av_capture capture:^(CMSampleBufferRef sampleBuffer) {
+        std::lock_guard<std::mutex> lock {capture_context->mutex};
+        if (!capture_context->active || !capture_context->image) {
+          return false;
+        }
+
         auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sampleBuffer);
         auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
 
-        auto av_img = (av_img_t *) img;
+        auto image = capture_context->image;
+        auto av_img = (av_img_t *) image;
 
         auto old_data_retainer = std::make_shared<temp_retain_av_img_t>(
           av_img->sample_buffer,
           av_img->pixel_buffer,
-          img->data
+          image->data
         );
 
         av_img->sample_buffer = new_sample_buffer;
         av_img->pixel_buffer = new_pixel_buffer;
-        img->data = new_pixel_buffer->data();
+        image->data = new_pixel_buffer->data();
 
-        img->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
-        img->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
-        img->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
-        img->pixel_pitch = img->row_pitch / img->width;
+        image->width = (int) CVPixelBufferGetWidth(new_pixel_buffer->buf);
+        image->height = (int) CVPixelBufferGetHeight(new_pixel_buffer->buf);
+        image->row_pitch = (int) CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf);
+        image->pixel_pitch = image->row_pitch / image->width;
 
         old_data_retainer = nullptr;
 
@@ -182,7 +302,24 @@ namespace platf {
         return 1;
       }
 
-      dispatch_semaphore_wait(signal, DISPATCH_TIME_FOREVER);
+      constexpr auto first_frame_timeout = 5s;
+      const auto timeout = dispatch_time(
+        DISPATCH_TIME_NOW,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(first_frame_timeout).count()
+      );
+      const bool timed_out = dispatch_semaphore_wait(signal, timeout) != 0;
+
+      {
+        std::lock_guard<std::mutex> lock {capture_context->mutex};
+        capture_context->active = false;
+        capture_context->image = nullptr;
+      }
+
+      if (timed_out) {
+        BOOST_LOG(error) << "Timed out waiting for the first frame from macOS display capture"sv;
+        [av_capture stopCapture];
+        return 1;
+      }
 
       return av_capture.captureFailed ? 1 : 0;
     }
@@ -241,6 +378,12 @@ namespace platf {
     }
 
     auto display = std::make_shared<av_display_t>();
+
+    // AVFoundation and ScreenCaptureKit do not deliver frames for sleeping
+    // displays. Hold the display awake for this capture object's lifetime and
+    // wake it before resolving the configured stable selector.
+    display->prevent_display_sleep();
+    wake_display_for_capture(display_name);
 
     // Print all displays available with it's name and id
     auto display_array = [AVVideo displayNames];
